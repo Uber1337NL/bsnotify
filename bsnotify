@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+# =====================
+# CONSTANTS / PATHS
+# =====================
+
+SERVICE_NAME = "bsnotify.service"
+SYSTEMD_UNIT_PATH = Path("/etc/systemd/system") / SERVICE_NAME
+
+INSTALL_BIN_PATH = Path("/usr/local/bin/bsnotify")
+CONFIG_DIR = Path("/etc/bsnotify.d")
+CONFIG_PATH = CONFIG_DIR / "printers.json"
+
+RUNTIME_USER = "bsnotify"
+RUNTIME_GROUP = "bsnotify"
+
+# SSDP / NOTIFY
+MCAST_ADDR = "255.255.255.255"
+MCAST_PORT = 2021
+NOTIFY_INTERVAL = 5
+
+# Default configuration written during install
+DEFAULT_CONFIG = {
+    "notify_interval": 5,
+    "printers": [
+        {
+            "name": "x1c",
+            "ip": "192.168.6.81",
+            "sn": "00M09C430501797",
+            "local_addresses": ["10.0.42.55"],
+        },
+        {
+            "name": "p1s",
+            "ip": "192.168.6.188",
+            "sn": "01P09C470403576",
+            "local_addresses": ["10.0.42.55"],
+        },
+    ],
+}
+
+SYSTEMD_UNIT_TEMPLATE = f"""[Unit]
+Description=BSNotify – Bambu Studio SSDP relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={INSTALL_BIN_PATH}
+User={RUNTIME_USER}
+Group={RUNTIME_GROUP}
+
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+# Networking restrictions
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+
+# Filesystem access: read-only configuration
+ReadOnlyPaths={CONFIG_DIR}
+
+# Minimal environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# =====================
+# UTILITIES
+# =====================
+
+def die(msg: str, code: int = 1):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def require_root(action: str):
+    if os.geteuid() != 0:
+        die(f"{action} must be executed as root")
+
+def run(cmd, check=True):
+    return subprocess.run(cmd, check=check)
+
+def atomic_write(path: Path, content: str, mode: int = 0o644):
+    """
+    Write a file atomically to avoid partial writes.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile("w", delete=False, dir=str(path.parent)) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    os.chmod(tmp_name, mode)
+    os.replace(tmp_name, path)
+
+def path_self() -> Path:
+    return Path(__file__).resolve()
+
+# =====================
+# INSTALL / UNINSTALL / STATUS
+# =====================
+
+def ensure_user_and_group():
+    """
+    Ensure runtime system user and group exist.
+    """
+    grp = subprocess.run(["getent", "group", RUNTIME_GROUP], stdout=subprocess.DEVNULL)
+    if grp.returncode != 0:
+        run(["groupadd", "--system", RUNTIME_GROUP])
+
+    usr = subprocess.run(["id", "-u", RUNTIME_USER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if usr.returncode != 0:
+        run([
+            "useradd",
+            "--system",
+            "--no-create-home",
+            "--home", "/nonexistent",
+            "--shell", "/usr/sbin/nologin",
+            "--gid", RUNTIME_GROUP,
+            RUNTIME_USER,
+        ])
+
+def install_binary():
+    """
+    Install this script as /usr/local/bin/bsnotify.
+    """
+    src = path_self()
+    if not src.exists():
+        die(f"Unable to locate script path: {src}")
+
+    INSTALL_BIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    content = src.read_bytes()
+    with NamedTemporaryFile("wb", delete=False, dir=str(INSTALL_BIN_PATH.parent)) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+
+    os.chmod(tmp_name, 0o755)
+    os.replace(tmp_name, INSTALL_BIN_PATH)
+
+def install_config(force: bool):
+    """
+    Install default configuration if not present.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Directory permissions: readable by runtime group
+    os.chmod(CONFIG_DIR, 0o750)
+    run(["chown", f"root:{RUNTIME_GROUP}", str(CONFIG_DIR)])
+
+    if CONFIG_PATH.exists() and not force:
+        return
+
+    atomic_write(CONFIG_PATH, json.dumps(DEFAULT_CONFIG, indent=2) + "\n", mode=0o640)
+    run(["chown", f"root:{RUNTIME_GROUP}", str(CONFIG_PATH)])
+
+def install_systemd_unit():
+    """
+    Install and activate systemd unit.
+    """
+    atomic_write(SYSTEMD_UNIT_PATH, SYSTEMD_UNIT_TEMPLATE, mode=0o644)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", SERVICE_NAME])
+    run(["systemctl", "restart", SERVICE_NAME])
+
+def install_all(force_config: bool):
+    require_root("--install")
+    ensure_user_and_group()
+    install_binary()
+    install_config(force_config)
+    install_systemd_unit()
+
+    print("Installation completed successfully.")
+    print(f"- Binary:   {INSTALL_BIN_PATH}")
+    print(f"- Config:   {CONFIG_PATH}")
+    print(f"- Service:  {SERVICE_NAME} (running as user '{RUNTIME_USER}')")
+    print("Check status with: bsnotify --status")
+
+def uninstall_all(purge: bool):
+    require_root("--uninstall")
+
+    # Stop and disable service (best-effort)
+    run(["systemctl", "stop", SERVICE_NAME], check=False)
+    run(["systemctl", "disable", SERVICE_NAME], check=False)
+
+    if SYSTEMD_UNIT_PATH.exists():
+        SYSTEMD_UNIT_PATH.unlink()
+
+    run(["systemctl", "daemon-reload"], check=False)
+
+    if INSTALL_BIN_PATH.exists():
+        INSTALL_BIN_PATH.unlink()
+
+    if purge:
+        # Remove configuration
+        if CONFIG_PATH.exists():
+            CONFIG_PATH.unlink()
+        if CONFIG_DIR.exists():
+            run(["rm", "-rf", str(CONFIG_DIR)], check=False)
+
+        # Remove runtime user and group
+        run(["userdel", RUNTIME_USER], check=False)
+        run(["groupdel", RUNTIME_GROUP], check=False)
+
+    print("Uninstall completed.")
+    if purge:
+        print("Purge enabled: configuration and user/group removed.")
+
+def status():
+    print(f"Service: {SERVICE_NAME}")
+    print(f"Binary:  {INSTALL_BIN_PATH}")
+    print(f"Config:  {CONFIG_PATH}")
+    print("")
+    run(["systemctl", "status", SERVICE_NAME], check=False)
+
+# =====================
+# RUNTIME: CONFIG LOAD
+# =====================
+
+def load_config():
+    """
+    Load and validate printer configuration.
+    """
+    if not CONFIG_PATH.exists():
+        die(f"Missing config: {CONFIG_PATH} (run bsnotify --install)")
+
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        die(f"Config parse error in {CONFIG_PATH}: {e}")
+
+    interval = int(data.get("notify_interval", NOTIFY_INTERVAL))
+    printers = data.get("printers", [])
+    if not isinstance(printers, list) or not printers:
+        die(f"No printers[] defined in {CONFIG_PATH}")
+
+    normalized = []
+    for p in printers:
+        try:
+            name = str(p["name"])
+            ip = str(p["ip"])
+            sn = str(p["sn"]).upper()
+            addrs = p.get("local_addresses", [])
+            if not isinstance(addrs, list) or not addrs:
+                die(f"Printer '{name}': local_addresses must be a non-empty list")
+            normalized.append({"name": name, "ip": ip, "sn": sn, "local_addresses": addrs})
+        except KeyError as e:
+            die(f"Printer entry missing key {e} in {CONFIG_PATH}")
+
+    return interval, normalized
+
+# =====================
+# RUNTIME: SSDP NOTIFY
+# =====================
+
+def uhttp_msg(method, headers):
+    out = [f"{method} * HTTP/1.1"]
+    for k, v in headers.items():
+        out.append(f"{k}: {v}")
+    out.append("\r\n")
+    return "\r\n".join(out)
+
+def notify_msg(printer):
+    headers = {
+        "HOST": f"{MCAST_ADDR}:{MCAST_PORT}",
+        "Server": "Buildroot/2018.02-rc3 UPnP/1.0 ssdpd/1.8",
+        "Location": printer["ip"],
+        "NT": "urn:bambulab-com:device:3dprinter:1",
+        "USN": printer["sn"],
+        "Cache-Control": "max-age=1800",
+        "DevModel.bambu.com": "C11",
+        "DevName.bambu.com": printer["name"],
+        "DevSignal.bambu.com": "-40",
+        "DevConnect.bambu.com": "lan",
+        "DevBind.bambu.com": " free",
+        "Devseclink.bambu.com": " secure",
+    }
+    return uhttp_msg("NOTIFY", headers).encode()
+
+async def sendloop(printer, transport, local_addr, interval):
+    target = (MCAST_ADDR, MCAST_PORT)
+    msg = notify_msg(printer)
+    while True:
+        print(f"SSDP NOTIFY {printer['name']} ({printer['ip']}) via {local_addr}", flush=True)
+        transport.sendto(msg, target)
+        await asyncio.sleep(interval)
+
+async def coroutine(printer, local_address, interval):
+    loop = asyncio.get_running_loop()
+
+    # Port 0 = let the OS choose an ephemeral port
+    local_addr_tuple = (local_address, 0)
+
+    transport, _ = await loop.create_datagram_endpoint(
+        asyncio.DatagramProtocol,
+        family=socket.AF_INET,
+        allow_broadcast=True,
+        local_addr=local_addr_tuple,
+    )
+
+    await sendloop(printer, transport, local_address, interval)
+
+def run_notifier():
+    interval, printers = load_config()
+    threads = []
+
+    try:
+        for printer in printers:
+            for addr in printer["local_addresses"]:
+                t = threading.Thread(
+                    target=asyncio.run,
+                    args=(coroutine(printer, addr, interval),),
+                    daemon=True,
+                )
+                threads.append(t)
+                t.start()
+
+        while True:
+            time.sleep(3600)
+
+    except KeyboardInterrupt:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+# =====================
+# ENTRYPOINT
+# =====================
+
+def main():
+    parser = argparse.ArgumentParser(description="BSNotify – Bambu Studio SSDP relay (multi-printer)")
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--install", action="store_true", help="Install binary, config and systemd service")
+    g.add_argument("--uninstall", action="store_true", help="Remove systemd service and binary")
+    g.add_argument("--status", action="store_true", help="Show systemd service status")
+
+    parser.add_argument(
+        "--force-config",
+        action="store_true",
+        help="With --install: overwrite printers.json with default configuration",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="With --uninstall: also remove config directory and runtime user/group",
+    )
+    args = parser.parse_args()
+
+    if args.install:
+        install_all(force_config=args.force_config)
+        return
+
+    if args.uninstall:
+        uninstall_all(purge=args.purge)
+        return
+
+    if args.status:
+        status()
+        return
+
+    # Default behavior: run notifier
+    run_notifier()
+
+if __name__ == "__main__":
+    main()
