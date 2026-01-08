@@ -31,6 +31,27 @@ MCAST_ADDR = "255.255.255.255"
 MCAST_PORT = 2021
 NOTIFY_INTERVAL = 5
 
+# Printer model references (aliases)
+# Printer | Use
+# ------- | -------------------
+# A1      | N2S
+# A1 Mini | N1
+# P1P     | C11
+# P1S     | C12
+# X1      | 3DPrinter-X1
+# X1C     | 3DPrinter-X1-Carbon
+# X1E     | C13
+MODEL_ALIASES = {
+    "A1": "N2S",
+    "A1MINI": "N1",
+    "A1_MINI": "N1",
+    "P1P": "C11",
+    "P1S": "C12",
+    "X1": "3DPrinter-X1",
+    "X1C": "3DPrinter-X1-Carbon",
+    "X1E": "C13",
+}
+
 # Default configuration written during install
 DEFAULT_CONFIG = {
     "notify_interval": 5,
@@ -39,13 +60,15 @@ DEFAULT_CONFIG = {
             "name": "x1c",
             "ip": "192.168.6.81",
             "sn": "00M09C430501797",
-            "local_addresses": ["10.0.42.55"],
+            "model": "X1C",
+            "local_addresses": ["auto"],
         },
         {
             "name": "p1s",
             "ip": "192.168.6.188",
             "sn": "01P09C470403576",
-            "local_addresses": ["10.0.42.55"],
+            "model": "P1S",
+            "local_addresses": ["auto"],
         },
     ],
 }
@@ -96,16 +119,20 @@ WantedBy=multi-user.target
 # UTILITIES
 # =====================
 
+
 def die(msg: str, code: int = 1):
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
+
 
 def require_root(action: str):
     if os.geteuid() != 0:
         die(f"{action} must be executed as root")
 
+
 def run(cmd, check=True):
     return subprocess.run(cmd, check=check)
+
 
 def atomic_write(path: Path, content: str, mode: int = 0o644):
     """
@@ -120,12 +147,53 @@ def atomic_write(path: Path, content: str, mode: int = 0o644):
     os.chmod(tmp_name, mode)
     os.replace(tmp_name, path)
 
+
 def path_self() -> Path:
     return Path(__file__).resolve()
+
+
+def resolve_model(value: str) -> str:
+    """
+    Resolve a model value either as an exact model string (e.g. "C12")
+    or as a friendly alias (e.g. "P1S", "X1C").
+    """
+    v = value.strip()
+    key = v.upper().replace(" ", "").replace("-", "_")
+    return MODEL_ALIASES.get(key, v)
+
+
+def get_primary_ip() -> str:
+    """
+    Determine the primary IPv4 address of the host based on routing.
+    Uses a UDP connect trick; no packets are sent.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+
+
+def normalize_local_addresses(name: str, raw_addrs) -> list[str]:
+    """
+    Normalize local_addresses:
+      - missing or ["auto"] -> [primary_ip]
+      - list of IPs         -> as-is
+    """
+    if raw_addrs is None:
+        return [get_primary_ip()]
+
+    if raw_addrs == ["auto"]:
+        return [get_primary_ip()]
+
+    if isinstance(raw_addrs, list) and raw_addrs:
+        return [str(a) for a in raw_addrs]
+
+    die(f"Printer '{name}': local_addresses must be a non-empty list or ['auto']")
+
 
 # =====================
 # INSTALL / UNINSTALL / STATUS
 # =====================
+
 
 def ensure_user_and_group():
     """
@@ -135,17 +203,27 @@ def ensure_user_and_group():
     if grp.returncode != 0:
         run(["groupadd", "--system", RUNTIME_GROUP])
 
-    usr = subprocess.run(["id", "-u", RUNTIME_USER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    usr = subprocess.run(
+        ["id", "-u", RUNTIME_USER],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     if usr.returncode != 0:
-        run([
-            "useradd",
-            "--system",
-            "--no-create-home",
-            "--home", "/nonexistent",
-            "--shell", "/usr/sbin/nologin",
-            "--gid", RUNTIME_GROUP,
-            RUNTIME_USER,
-        ])
+        run(
+            [
+                "useradd",
+                "--system",
+                "--no-create-home",
+                "--home",
+                "/nonexistent",
+                "--shell",
+                "/usr/sbin/nologin",
+                "--gid",
+                RUNTIME_GROUP,
+                RUNTIME_USER,
+            ]
+        )
+
 
 def install_binary():
     """
@@ -167,6 +245,7 @@ def install_binary():
     os.chmod(tmp_name, 0o755)
     os.replace(tmp_name, INSTALL_BIN_PATH)
 
+
 def install_config(force: bool):
     """
     Install default configuration if not present.
@@ -183,6 +262,7 @@ def install_config(force: bool):
     atomic_write(CONFIG_PATH, json.dumps(DEFAULT_CONFIG, indent=2) + "\n", mode=0o640)
     run(["chown", f"root:{RUNTIME_GROUP}", str(CONFIG_PATH)])
 
+
 def install_systemd_unit():
     """
     Install and activate systemd unit.
@@ -191,6 +271,7 @@ def install_systemd_unit():
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", SERVICE_NAME])
     run(["systemctl", "restart", SERVICE_NAME])
+
 
 def install_all(force_config: bool):
     require_root("--install")
@@ -204,6 +285,7 @@ def install_all(force_config: bool):
     print(f"- Config:   {CONFIG_PATH}")
     print(f"- Service:  {SERVICE_NAME} (running as user '{RUNTIME_USER}')")
     print("Check status with: bsnotify --status")
+
 
 def uninstall_all(purge: bool):
     require_root("--uninstall")
@@ -235,6 +317,7 @@ def uninstall_all(purge: bool):
     if purge:
         print("Purge enabled: configuration and user/group removed.")
 
+
 def status():
     print(f"Service: {SERVICE_NAME}")
     print(f"Binary:  {INSTALL_BIN_PATH}")
@@ -242,9 +325,11 @@ def status():
     print("")
     run(["systemctl", "status", SERVICE_NAME], check=False)
 
+
 # =====================
 # RUNTIME: CONFIG LOAD
 # =====================
+
 
 def load_config():
     """
@@ -269,18 +354,30 @@ def load_config():
             name = str(p["name"])
             ip = str(p["ip"])
             sn = str(p["sn"]).upper()
-            addrs = p.get("local_addresses", [])
-            if not isinstance(addrs, list) or not addrs:
-                die(f"Printer '{name}': local_addresses must be a non-empty list")
-            normalized.append({"name": name, "ip": ip, "sn": sn, "local_addresses": addrs})
+
+            model_raw = str(p.get("model", "")).strip()
+            if not model_raw:
+                die(
+                    f"Printer '{name}': model is required "
+                    f"(e.g. P1S, X1C, C12, 3DPrinter-X1-Carbon)"
+                )
+            model = resolve_model(model_raw)
+
+            addrs = normalize_local_addresses(name, p.get("local_addresses"))
+
+            normalized.append(
+                {"name": name, "ip": ip, "sn": sn, "model": model, "local_addresses": addrs}
+            )
         except KeyError as e:
             die(f"Printer entry missing key {e} in {CONFIG_PATH}")
 
     return interval, normalized
 
+
 # =====================
 # RUNTIME: SSDP NOTIFY
 # =====================
+
 
 def uhttp_msg(method, headers):
     out = [f"{method} * HTTP/1.1"]
@@ -288,6 +385,7 @@ def uhttp_msg(method, headers):
         out.append(f"{k}: {v}")
     out.append("\r\n")
     return "\r\n".join(out)
+
 
 def notify_msg(printer):
     headers = {
@@ -297,7 +395,7 @@ def notify_msg(printer):
         "NT": "urn:bambulab-com:device:3dprinter:1",
         "USN": printer["sn"],
         "Cache-Control": "max-age=1800",
-        "DevModel.bambu.com": "C11",
+        "DevModel.bambu.com": printer["model"],
         "DevName.bambu.com": printer["name"],
         "DevSignal.bambu.com": "-40",
         "DevConnect.bambu.com": "lan",
@@ -306,13 +404,18 @@ def notify_msg(printer):
     }
     return uhttp_msg("NOTIFY", headers).encode()
 
+
 async def sendloop(printer, transport, local_addr, interval):
     target = (MCAST_ADDR, MCAST_PORT)
     msg = notify_msg(printer)
     while True:
-        print(f"SSDP NOTIFY {printer['name']} ({printer['ip']}) via {local_addr}", flush=True)
+        print(
+            f"SSDP NOTIFY {printer['name']} ({printer['ip']}) model={printer['model']} via {local_addr}",
+            flush=True,
+        )
         transport.sendto(msg, target)
         await asyncio.sleep(interval)
+
 
 async def coroutine(printer, local_address, interval):
     loop = asyncio.get_running_loop()
@@ -328,6 +431,7 @@ async def coroutine(printer, local_address, interval):
     )
 
     await sendloop(printer, transport, local_address, interval)
+
 
 def run_notifier():
     interval, printers = load_config()
@@ -350,9 +454,11 @@ def run_notifier():
     except KeyboardInterrupt:
         os.kill(os.getpid(), signal.SIGTERM)
 
+
 # =====================
 # ENTRYPOINT
 # =====================
+
 
 def main():
     parser = argparse.ArgumentParser(description="BSNotify – Bambu Studio SSDP relay (multi-printer)")
@@ -387,6 +493,7 @@ def main():
 
     # Default behavior: run notifier
     run_notifier()
+
 
 if __name__ == "__main__":
     main()
