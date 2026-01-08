@@ -9,6 +9,7 @@ The script is able to announce thede Bambu Labs printers:
 - A1-series like the: A1, A1mini
 - P1 series like the: P1P, P1S
 - X1 series like the: X1, X2C (X1 Carbom), X1E
+
 If anyone is able to provice a SSDP capture of nwer printers like the H2-series or the P2S feel free to add an issue to this repository or change the code (bsnotify) and create a Pull Request.
 
 You need to know:
