@@ -37,20 +37,30 @@ NOTIFY_INTERVAL = 5
 # ------- | -------------------
 # A1      | N2S
 # A1 Mini | N1
+# H2D     | O1D
+# H2C     | O1C
+# H2S     | O1S
 # P1P     | C11
 # P1S     | C12
+# P2S     | N7
 # X1      | 3DPrinter-X1
 # X1C     | 3DPrinter-X1-Carbon
 # X1E     | C13
+# X2D     | N6
 MODEL_ALIASES = {
     "A1": "N2S",
     "A1MINI": "N1",
     "A1_MINI": "N1",
+    "H2D": "O1D",
+    "H2C": "O1C",
+    "H2S": "O1S",
     "P1P": "C11",
     "P1S": "C12",
+    "P2S": "N7",
     "X1": "3DPrinter-X1",
     "X1C": "3DPrinter-X1-Carbon",
     "X1E": "C13",
+    "X2D": "N6",
 }
 
 # Default configuration written during install
@@ -243,7 +253,9 @@ def install_binary():
     INSTALL_BIN_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     content = src.read_bytes()
-    with NamedTemporaryFile("wb", delete=False, dir=str(INSTALL_BIN_PATH.parent)) as tmp:
+    with NamedTemporaryFile(
+        "wb", delete=False, dir=str(INSTALL_BIN_PATH.parent)
+    ) as tmp:
         tmp.write(content)
         tmp.flush()
         os.fsync(tmp.fileno())
@@ -481,8 +493,7 @@ def run_notifier():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BS"
-        "Notify – Bambu Studio SSDP relay (multi-printer)"
+        description="BSNotify – Bambu Studio SSDP relay (multi-printer)"
     )
     g = parser.add_mutually_exclusive_group()
     g.add_argument(
