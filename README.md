@@ -6,11 +6,10 @@ The script will be installed ans create a seperate user/group to run in unprivil
 
 The script is able to announce thede Bambu Labs printers:
 
-- A1-series like the: A1, A1mini
-- P1 series like the: P1P, P1S
-- X1 series like the: X1, X2C (X1 Carbom), X1E
-
-If anyone is able to provice a SSDP capture of nwer printers like the H2-series or the P2S feel free to add an issue to this repository or change the code (bsnotify) and create a Pull Request.
+- A-series like the: A1, A1mini
+- H-series like the: H2C, H2D, H2S
+- P series like the: P1P, P1S, P2S
+- X series like the: X1, X1C (Carbom), X1E, X2D
 
 You need to know:
 
